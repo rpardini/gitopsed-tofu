@@ -1,0 +1,225 @@
+###
+### Define's
+###
+{{- define "gitopsed-tofu.tf-configmap" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-tofu-sources
+  namespace: {{ .Release.Namespace }}
+data:
+  # loop over all the .tf files in the tf/ folder. create one configmap entry for each file and its content, as a string.
+{{ (.Files.Glob "tf/tf-*.tf").AsConfig | indent 2 }}
+  # loop over all values.yaml .tofu.tf as map of filename to content. create one configmap entry for each file and its content, as a string.
+{{- range $key, $value := .Values.tofu.tf }}
+  "{{ $key }}": |-
+    {{ $value | nindent 4 }}
+{{- end }}
+
+  # Generate the terraform.tf file based on values; mostly for convenience
+  "terraf{{- /* dont parse */ -}}orm.tf": |-
+    terraform {
+      required_providers {
+        {{- range .Values.tofu.required_providers }}
+        {{ .alias }} = {
+          source = "{{ .source }}"
+          version = "{{ .version }}"
+        }
+        {{- end }}
+      }
+      {{- if .Values.tofu.backend.kubernetes.enabled }}
+      # Store state in k8s Secret; limited to 1MB, don't go crazy; it is gzipped.
+      backend "kubernetes" {
+        in_cluster_config = true
+        secret_suffix = "{{ .Values.tofu.backend.kubernetes.secret_suffix | default .Release.Name }}"
+        namespace = "{{ .Release.Namespace }}"
+      }
+      {{- end }}
+    
+      {{- if .Values.tofu.backend.pg.enabled }}
+      # Store state in PgSQL.
+      backend "pg" {
+        # This is configured via PGHOST env var (et al): https://www.postgresql.org/docs/current/libpq-envars.html
+      }
+      {{- end }}
+    }
+{{- end }}
+---
+
+{{- define "gitopsed-tofu.pt-secret" -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-pt-secret
+  namespace: {{ .Release.Namespace }}
+stringData:
+  # Loop over the map and create a key-value pair for each entry.
+  {{- range $key, $value := .Values.secretsToEnv.plaintext }}
+  {{ $key }}: "{{ $value }}"
+  {{- end }}
+{{- end }}
+---
+
+{{- define "gitopsed-tofu.rbac" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-tofu-sa
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-tofu-role
+  namespace: {{ .Release.Namespace }}
+rules:
+  # so tofu can use a Secret for state
+  - apiGroups: [ "" ]
+    resources: [ "secrets" ]
+    verbs: [ "list", "create" ]
+  - apiGroups: [ "" ]
+    resources: [ "secrets" ]
+    verbs: [ "get", "update", "delete" ]
+    resourceNames: [ "tfstate-default-{{ .Values.tofu.backend.kubernetes.secret_suffix | default .Release.Name }}" ]
+  # so tofu can use a Lease for locking state
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    verbs: [ "list", "create" ]
+  - apiGroups: [ "coordination.k8s.io" ]
+    resources: [ "leases" ]
+    verbs: [ "get", "list", "watch", "create", "update", "delete" ]
+    resourceNames: [ "lock-tfstate-default-{{ .Values.tofu.backend.kubernetes.secret_suffix | default .Release.Name }}" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-tofu-rolebinding
+  namespace: {{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-tofu-sa
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ .Release.Name }}-tofu-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+---
+
+###
+### Define: Job, but only spec is used as output, full job (with comments containing dependencies' content) is Hashed.
+### the job-fragment declares apiVersion/kind so autocomplete works in editors.
+###
+
+{{- define "gitopsed-tofu.jobSpec" -}}
+{{- $job := include "gitopsed-tofu.job-fragment" . | fromYaml -}}
+{{- $job.spec | toYaml -}}
+{{- end}}
+
+{{- define "gitopsed-tofu.jobHash" -}}
+{{- include "gitopsed-tofu.job-fragment" .  -}} # This includes comments
+{{- end}}
+
+{{- define "gitopsed-tofu.job-fragment" -}}
+apiVersion: batch/v1
+kind: Job
+spec: # this is what is returned by the gitopsed-tofu.jobSpec template
+  backoffLimit: 2 # once might be a fluke, but 3 times is too much
+  template:
+    spec:
+      serviceAccountName: {{ .Release.Name }}-tofu-sa
+      initContainers:
+        - name: 010-copy-sources-to-work
+          image: "{{ .Values.tofu.image }}" # which conveniently also has bash and cp; it's an alpine derivative
+          command: [ "bash", "-c", "cp -Lvr /sources/* /work" ] # Copy from /sources to /work by replacing symlinks with copies of the target
+          volumeMounts: [ { mountPath: "/sources", name: sources }, { mountPath: "/work", name: workdir } ]
+        - name: 030-tofu-init
+          image: "{{ .Values.tofu.image }}"
+          command: [ "tofu", "init", "-input=false" ]
+          workingDir: "/work"
+          volumeMounts: [ { mountPath: "/work", name: workdir } ]
+          {{- include "gitopsed-tofu.envVars" . | nindent 10 }}
+        - name: 040-tofu-validate
+          image: "{{ .Values.tofu.image }}"
+          command: [ "tofu", "validate" ]
+          workingDir: "/work"
+          volumeMounts: [ { mountPath: "/work", name: workdir } ]
+          {{- include "gitopsed-tofu.envVars" . | nindent 10 }}
+        - name: 050-tofu-plan-{{.Values.tofu.operation}}
+          image: "{{ .Values.tofu.image }}"
+          command:
+            - "tofu"
+            - "plan"
+            {{- if eq .Values.tofu.operation "destroy" }}
+            - "-{{.Values.tofu.operation}}"
+            {{- end }}
+            - "-input=false"
+            - "-out=/plan/work.tfplan"
+          workingDir: "/work"
+          volumeMounts: [ { mountPath: "/work", name: workdir }, { mountPath: "/plan", name: plan } ]
+          {{- include "gitopsed-tofu.envVars" . | nindent 10 }}
+      containers:
+        - name: 070-tofu-{{.Values.tofu.operation}}
+          image: "{{ .Values.tofu.image }}"
+          command: [ "tofu", "apply", "--auto-approve", "-input=false", "/plan/work.tfplan" ] # 'apply' is also used to destroy, if such is the plan
+          workingDir: "/work"
+          volumeMounts: [ { mountPath: "/work", name: workdir }, { mountPath: "/plan", name: plan } ]
+          {{- include "gitopsed-tofu.envVars" . | nindent 10 }}
+      restartPolicy: Never
+      volumes:
+        - name: workdir
+          emptyDir: { }
+        - name: plan
+          emptyDir: { }
+        - name: sources
+          configMap:
+            name: {{ .Release.Name }}-tofu-sources
+
+# A commented-out version of the tf-configmap, for hashing purposes.
+# {{ include "gitopsed-tofu.tf-configmap" . | nindent 0 | replace "\n" "\n# " | printf "# %s" }}
+# A commented-out version of the gitopsed-tofu.pt-secret, for hashing purposes.
+# {{ include "gitopsed-tofu.pt-secret" . | nindent 0 | replace "\n" "\n# " | printf "# %s" }}
+# A commented-out version of the tf-configmap, for hashing purposes.
+# {{ include "gitopsed-tofu.rbac" . | nindent 0 | replace "\n" "\n# " | printf "# %s" }}
+
+{{- end }}
+---
+
+{{- define "gitopsed-tofu.envVars" -}}
+env:
+  # Loop over the map and create a key-value pair for each entry.
+{{- range $key, $value := .Values.secretsToEnv.plaintext }}
+  - { name: "{{ $key }}", valueFrom: { secretKeyRef: { name: "{{ $.Release.Name }}-pt-secret", key: "{{ $key }}" } } }
+{{- end }}
+  # Same, but loop over secretsToEnv.existingSecrets
+{{- range $existingSecret, $keys := .Values.secretsToEnv.existingSecrets }}
+{{- range $keys }}
+  - { name: "{{ . }}", valueFrom: { secretKeyRef: { name: "{{ $existingSecret }}", key: "{{ . }}" } } }
+{{- end }}
+{{- end }}
+{{- end }}
+
+###
+### Actual output, using includes
+###
+---
+{{ include "gitopsed-tofu.pt-secret" .  }}
+---
+{{ include "gitopsed-tofu.tf-configmap" .  }}
+---
+{{ include "gitopsed-tofu.rbac" .  }}
+---
+# A simple kubernetes Job to run opentofu under ArgoCD; it mounts a configmap with the .tf files and passes some secrets as env vars.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-tofu-{{ include "gitopsed-tofu.jobHash" . | sha256sum | trunc 8 }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: "0.0.1"
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec: {{ include "gitopsed-tofu.jobSpec" . | nindent 2 }}
+
+

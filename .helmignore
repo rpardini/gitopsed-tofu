@@ -1,0 +1,4 @@
+.idea
+.git
+tf/.terraform*
+tf/terraform.tf

@@ -1,0 +1,4 @@
+apiVersion: v2
+name: tofu
+version: "0.0.1"
+description: Deploy TF stuff using kubernetes sans an operator, just a plain hashed-name Job
